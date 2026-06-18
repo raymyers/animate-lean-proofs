@@ -29,7 +29,7 @@
         devShells.default = pkgs.mkShell {
           packages = [
             # `elan` manages the Lean toolchain; it reads `lean-toolchain`
-            # (leanprover/lean4:v4.26.0) and provides `lean` and `lake`.
+            # (leanprover/lean4:v4.30.0) and provides `lean` and `lake`.
             pkgs.elan
             python
             blender

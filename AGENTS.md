@@ -28,18 +28,32 @@ blender -b --python animate_proof.py -- /tmp/mul_pow.json --out /tmp/mul_pow.mp4
 open the animation in the Blender GUI for interactive scrubbing instead.
 
 `Animate` takes `FILE_PATH CONST_NAME` plus optional flags (see `parseArgs` in
-`Animate.lean`): `--print-infotree`, `--print-stage1`, `--print-stage2` (dump
-intermediate representations instead of/alongside the final JSON),
-`--min-match-len N` (minimum run length for diff alignment), and
-`--nonmatchers "chars"` (characters excluded from diff matching). These flags are
-the primary way to debug the Lean side — inspect a stage rather than guessing.
+`Animate.lean`):
+- `--print-infotree`, `--print-stage1`, `--print-stage2` — dump intermediate
+  representations instead of/alongside the final JSON.
+- `--min-match-len N` — minimum run length for diff alignment.
+- `--nonmatchers "chars"` — characters excluded from diff matching.
+- `--verbose` — timestamped per-phase / per-command / per-goal progress to
+  stderr. This is the first thing to reach for when a run seems to hang; it
+  localizes the stall (imports vs. elaboration vs. stage 1/2/3 vs. a specific
+  goal) in seconds. stderr only, so it never pollutes the JSON on stdout.
+- `--max-goal-chars N` (default 1200, 0 = unlimited) — goal states longer than
+  this are abbreviated (head + `⟨… elided …⟩` + tail) before diffing/rendering.
+- `--max-match-chars N` (default 3000) — goals larger than this skip the
+  char-level diff entirely (animate as a replace, not a morph).
+
+Why the last two exist: a single `rw` that unfolds a definition can produce a
+~14 KB intermediate goal state. The stage-3 diff (`do_match`) is ≈O(n³), and the
+Blender renderer builds one object per character, so without these caps a large
+proof hangs for many minutes in both. See the performance notes below.
 
 There is no test suite. Validation is empirical: run a theorem from `Input/`
-through both stages and inspect the JSON or the rendered output.
+through both stages and inspect the JSON or the rendered output. For a quick
+end-to-end smoke test use `Input/NNG.lean NNG.mul_pow` (tiny goals, renders fast).
 
 ### Requirements
 
-- Lean toolchain is pinned by `lean-toolchain` (`leanprover/lean4:v4.26.0`); use
+- Lean toolchain is pinned by `lean-toolchain` (`leanprover/lean4:v4.30.0`); use
   `elan`/`lake` so the pin is honored. mathlib is pinned in `lakefile.lean`.
 - `pygmentize` (the Pygments CLI) must be on `PATH` — `HighlightSyntax.assign_colors`
   shells out to `pygmentize -l lean4 -f raw`. Missing it breaks stage 3.
@@ -122,6 +136,31 @@ top-to-bottom — the data structures are declared before the stages that build 
 aggregated by `Input.lean`. These are the corpus you animate; a proof must
 **not** already be in the environment (`Animate` errors if `CONST_NAME` exists),
 so it elaborates the file fresh.
+
+## Performance & large proofs
+
+The NNG/IMO examples have small goal states, so this is invisible there — but a
+real mathlib-scale proof (large goals, many tactics) exposes three scaling traps.
+All three are now mitigated; the knobs are above.
+
+- **`Animate` re-elaborates the *whole input file* from source** (`processFile`
+  runs `processCommands` to EOF before extracting the target). Point it at a file
+  containing **only** the imports + the one declaration you want — don't run it on
+  a 400-line module to animate one lemma in it.
+- **Stage-3 diff is ≈O(n³)** in goal-state length (`StringMatching.do_match`).
+  A definition-unfolding `rw` can yield a ~14 KB intermediate goal that hangs it
+  for tens of minutes. `--max-goal-chars` (abbreviate at the source) and
+  `--max-match-chars` (skip the diff) bound this.
+- **The Blender renderer builds one object per character.** `new_char_obj` uses
+  the low-level data API (`bpy.data.curves.new` / `objects.new`) — *not* `bpy.ops`
+  — because `bpy.ops.object.text_add` + `convert` trigger a depsgraph update per
+  call, making scene construction ≈O(n²): a few thousand glyphs took ~14 min via
+  `bpy.ops` vs. ~9 s via the data API. If you touch glyph creation, stay off
+  `bpy.ops`. Each glyph keeps its **own** material (colors are keyframed per
+  character), so materials can't be shared.
+
+When a run seems stuck, reach for `--verbose` first — it pinpoints which of these
+(or plain elaboration) is the culprit.
 
 ## Conventions worth knowing
 

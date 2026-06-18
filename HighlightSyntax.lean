@@ -105,7 +105,9 @@ def assign_colors (s : String) : IO ColorMap := do
     if line = "" then continue
     let [cat, val] := line.splitToList (· = '\t') |
       throw (IO.userError s!"bad pygmentize output: {line}")
-    let val' := (val.drop 1).dropRight 1 ++ "\""
+    -- drop the leading and trailing quote chars, then re-add a closing quote.
+    -- (operate on `List Char` to stay independent of String/String.Slice API churn)
+    let val' := String.ofList ((val.toList.drop 1).dropLast) ++ "\""
     match Std.Internal.Parsec.String.Parser.run Parse.str val' with
     | .ok v =>
       for _c in v.toList do

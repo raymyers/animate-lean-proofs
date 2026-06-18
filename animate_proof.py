@@ -214,16 +214,26 @@ class Goal:
         if c.isspace():
             cobj = None
         else:
-            bpy.ops.object.text_add()
-            cobj = bpy.context.object
+            # Build each glyph through the low-level data API rather than
+            # `bpy.ops.object.text_add()` + `convert(target='MESH')`. Those
+            # operators each trigger a full depsgraph update, so creating one
+            # object per character is ~O(n^2) over a whole proof and made large
+            # proofs take many minutes to lay out. The data API is ~O(n).
+            # No mesh is needed: only location, scale, and the material color are
+            # ever read/animated (a FONT object supports all three).
+            curve = bpy.data.curves.new(name="Char", type='FONT')
+            curve.body = c
+            curve.font = MONOFONT
+            # Each character keeps its own material: per-glyph colors are
+            # keyframed (syntax highlighting + the highlight sweep), so the
+            # material can't be shared across characters.
             cmaterial = bpy.data.materials.new(name="CharMaterial")
             cmaterial.diffuse_color = (1, 1, 1, 1)
-            cobj.data.materials.append(cmaterial)
-            cobj.data.body = c
-            cobj.data.font = MONOFONT
-            bpy.ops.object.convert(target='MESH')
+            curve.materials.append(cmaterial)
+            cobj = bpy.data.objects.new(name="Char", object_data=curve)
+            bpy.context.scene.collection.objects.link(cobj)
             cobj.parent = parent
-            cobj.scale=(scale,scale,scale)
+            cobj.scale = (scale, scale, scale)
 
         result = CharObj(c, cobj)
         return result

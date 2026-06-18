@@ -19,6 +19,14 @@ structure Config where
   print_stage2 : Bool := false
   min_match_len : Nat := 2
   nonmatchers : String := ""
+  verbose : Bool := false
+  -- Upper bound on goal-state length (chars) fed to the O(n^3) greedy diff.
+  -- Above this, char-level matching is skipped so huge intermediate goal
+  -- states (e.g. right after `rw` unfolds a definition) don't hang the tool.
+  max_match_chars : Nat := 3000
+  -- Goal states longer than this (chars) are abbreviated (head + tail, middle
+  -- elided) before diffing/highlighting/rendering. 0 = unlimited.
+  max_goal_chars : Nat := 1200
 
 def parseArgs (args : Array String) : IO Config := do
   if args.size < 2 then
@@ -43,6 +51,16 @@ def parseArgs (args : Array String) : IO Config := do
        idx := idx + 1
        let x := args[idx]!
        cfg := {cfg with nonmatchers := x}
+    | "--verbose" =>
+       cfg := {cfg with verbose := true}
+    | "--max-match-chars" =>
+       idx := idx + 1
+       let x := args[idx]!.toNat!
+       cfg := {cfg with max_match_chars := x}
+    | "--max-goal-chars" =>
+       idx := idx + 1
+       let x := args[idx]!.toNat!
+       cfg := {cfg with max_goal_chars := x}
     | s => throw <| IO.userError s!"unknown argument {s}"
     idx := idx + 1
 
@@ -203,7 +221,7 @@ def left_trim_lines (lines : String) (col : Nat) : String := Id.run do
   for line in lines do
     let pfx := Substring.Raw.mk line ⟨0⟩ ⟨col⟩
     if pfx.toString = String.replicate col ' '
-    then rev_result := line.drop col :: rev_result
+    then rev_result := String.ofList (line.toList.drop col) :: rev_result
     else rev_result := line :: rev_result
   return String.intercalate "\n" rev_result.reverse
 
@@ -251,6 +269,23 @@ def _root_.Lean.Elab.TacticInfo.name? (t : TacticInfo) : Option Name :=
 
 def GOAL_PP_WIDTH : Nat := 80
 
+-- Abbreviate goal states longer than `maxGoalCharsRef` (0 = unlimited), set from
+-- `--max-goal-chars`. Huge goal states (e.g. right after `rw` unfolds a
+-- definition into a giant term) otherwise bloat the JSON, the O(n^3) diff, and
+-- especially the Blender scene. We keep the head and tail and elide the middle.
+initialize maxGoalCharsRef : IO.Ref Nat ← IO.mkRef 0
+
+def abbreviateGoalState (s : String) : IO String := do
+  let maxLen ← maxGoalCharsRef.get
+  if maxLen == 0 || s.length ≤ maxLen then return s
+  let chars := s.toList
+  let n := chars.length
+  let headLen := (maxLen * 2) / 3
+  let tailLen := maxLen - headLen
+  let headStr := String.ofList (chars.take headLen)
+  let tailStr := String.ofList (chars.drop (n - tailLen))
+  return s!"{headStr}\n  ⟨… {n - headLen - tailLen} chars elided …⟩\n{tailStr}"
+
 unsafe def visitTacticInfo (ci : ContextInfo) (ti : TacticInfo)
     (acc : List TacticStep) : IO (List TacticStep) := do
   let src := ci.fileMap.source
@@ -265,7 +300,8 @@ unsafe def visitTacticInfo (ci : ContextInfo) (ti : TacticInfo)
     let doprint : MetaM _ := Meta.ppGoal g
     let cm := doprint.run' (s := { mctx := ti.mctxBefore })
     let fm ← ci.runCoreM cm
-    goals_before := goals_before ++ [⟨g.name.toString, fm.pretty (width := GOAL_PP_WIDTH)⟩]
+    goals_before := goals_before ++
+      [⟨g.name.toString, ← abbreviateGoalState (fm.pretty (width := GOAL_PP_WIDTH))⟩]
 
     let _x := ti.mctxAfter.getExprAssignmentCore? g
     -- collect all fvars that appear in x ...
@@ -277,7 +313,8 @@ unsafe def visitTacticInfo (ci : ContextInfo) (ti : TacticInfo)
     let doprint : MetaM _ := Meta.ppGoal g
     let cm := doprint.run' (s := { mctx := ti.mctxAfter })
     let fm ← ci.runCoreM cm
-    goals_after := goals_after ++ [⟨g.name.toString, fm.pretty (width := GOAL_PP_WIDTH)⟩]
+    goals_after := goals_after ++
+      [⟨g.name.toString, ← abbreviateGoalState (fm.pretty (width := GOAL_PP_WIDTH))⟩]
 
   if let some ``Lean.Parser.Tactic.tacticSeq1Indented := ti.name?
   then
@@ -404,6 +441,23 @@ unsafe def visitNode (ci : ContextInfo) (info : Info)
   | .ofTacticInfo ti => visitTacticInfo ci ti acc
   | _ => pure acc
 
+-- Progress logging (to stderr, so it never pollutes the JSON on stdout).
+-- `logStartRef` holds the monotonic ms at which processing began.
+initialize logStartRef : IO.Ref Nat ← IO.mkRef 0
+initialize logVerboseRef : IO.Ref Bool ← IO.mkRef false
+
+/-- Log a high-level progress message to stderr with an elapsed-ms stamp. -/
+def logProgress (msg : String) : IO Unit := do
+  let start ← logStartRef.get
+  let now ← IO.monoMsNow
+  let h ← IO.getStderr
+  h.putStrLn s!"[Animate +{now - start}ms] {msg}"
+  h.flush
+
+/-- Like `logProgress`, but only when `--verbose` is set (fine-grained logging). -/
+def logVerbose (msg : String) : IO Unit := do
+  if ← logVerboseRef.get then logProgress msg
+
 unsafe def extractToplevelStep (tree : InfoTree) : IO TacticStep := do
   let steps ← collectNodesBottomUpM (m := IO) visitNode tree
   let [step] := steps | throw <| IO.userError "got more than one toplevel step"
@@ -444,12 +498,22 @@ partial def stage2 (step : TacticStep) : IO Stage2State := do
 
 def stage3_inner (config : Config) (step : TacticStep') : GoalAction := Id.run do
     let mut ts_rev : List TransformedGoal := []
+    let s1 := step.goal_before.state
     for g in step.goals_after do
-      let im := Animate.do_match step.goal_before.state g.state
-                                 (min_match_len := config.min_match_len)
-                                 (nonmatchers := config.nonmatchers)
-                                 (s1_reverse_order := step.reverse_s1)
-                                 (s2_reverse_order := step.reverse_s2)
+      let s2 := g.state
+      let im :=
+        if max s1.length s2.length > config.max_match_chars then
+          -- Goal state too large for the O(n^3) greedy diff (e.g. a giant
+          -- intermediate term right after `rw` unfolds a definition). Skip
+          -- char-level matching: an all-`none` map animates the step as a
+          -- replacement rather than a per-character morph.
+          ⟨Array.replicate s1.length none, Array.replicate s2.length none⟩
+        else
+          Animate.do_match s1 s2
+            (min_match_len := config.min_match_len)
+            (nonmatchers := config.nonmatchers)
+            (s1_reverse_order := step.reverse_s1)
+            (s2_reverse_order := step.reverse_s2)
       ts_rev := {goal := g, indexMaps := im} :: ts_rev
     let ga : GoalAction := {
       startGoalId := step.goal_before.goalId
@@ -469,6 +533,12 @@ partial def stage3 (config : Config) (state2 : Stage2State) : IO Movie := do
     visited := visited.insert currentGoal
     let .some step :=
       state2.steps.get? currentGoal | panic s!"goal not found {currentGoal}"
+    let oversized := step.goals_after.any (fun g ↦
+      max step.goal_before.state.length g.state.length > config.max_match_chars)
+    let oversizedTag := if oversized then " [diff skipped: oversized]" else ""
+    logVerbose (s!"stage 3: goal {currentGoal} via `{step.text}` "
+      ++ s!"({step.goal_before.state.length} chars, {step.goals_after.length} result(s), "
+      ++ s!"{visited.size} done){oversizedTag}")
     colorings := colorings.push ⟨currentGoal, ← HighlightSyntax.assign_colors step.goal_before.state⟩
     let mut goal_actions := [stage3_inner config step]
     currentGoals := []
@@ -492,26 +562,34 @@ partial def stage3 (config : Config) (state2 : Stage2State) : IO Movie := do
            startGoal := state2.startGoal,
            highlighting := colorings}
 
-unsafe def processCommands : Frontend.FrontendM (List (Environment × InfoState)) := do
+unsafe def processCommands (count : Nat := 0) :
+    Frontend.FrontendM (List (Environment × InfoState)) := do
   let done ← Lean.Elab.Frontend.processCommand
   let st := ← get
   let infoState := st.commandState.infoState
   let env' := st.commandState.env
+
+  logVerbose s!"elaborated command #{count + 1} ({infoState.trees.size} info tree(s))"
 
   -- clear the infostate
   set {st with commandState := {st.commandState with infoState := {}}}
   if done
   then return [(env', infoState)]
   else
-    return (env', infoState) :: (←processCommands)
+    return (env', infoState) :: (←processCommands (count + 1))
 
 unsafe def processFile (config : Config) : IO Unit := do
+  logStartRef.set (← IO.monoMsNow)
+  logVerboseRef.set config.verbose
+  maxGoalCharsRef.set config.max_goal_chars
   initSearchPath (← findSysroot)
   let mut input ← IO.FS.readFile config.file_path
   Lean.enableInitializersExecution
   let inputCtx := Lean.Parser.mkInputContext input config.file_path.toString
   let (header, parserState, messages) ← Lean.Parser.parseHeader inputCtx
+  logProgress "parsed header; processing imports…"
   let (env, messages) ← Lean.Elab.processHeader header {} messages inputCtx
+  logProgress "imports loaded"
 
   if messages.hasErrors then
     for msg in messages.toList do
@@ -526,23 +604,29 @@ unsafe def processFile (config : Config) : IO Unit := do
 
   let commandState := { Lean.Elab.Command.mkState env messages {} with infoState.enabled := true }
 
+  logProgress "elaborating commands…"
   let (steps, _frontendState) ← (processCommands.run { inputCtx := inputCtx }).run
     { commandState := commandState, parserState := parserState, cmdPos := parserState.pos }
+  logProgress s!"elaborated {steps.length} command-step(s); locating {config.const_name}…"
 
   -----
   for ⟨env, s⟩ in steps do
     if env.contains config.const_name then
+      logProgress s!"found {config.const_name}; processing {s.trees.size} info tree(s)"
       for tree in s.trees do
         if config.print_infotree then
            IO.println (Format.pretty (←tree.format))
         let step ← extractToplevelStep tree
+        logProgress "stage 1 complete (info tree → tactic steps)"
         if config.print_stage1 then
           IO.println s!"{ToJson.toJson step}"
         let stage2state ← stage2 step
+        logProgress s!"stage 2 complete ({stage2state.steps.size} tactic step(s) mapped)"
         if config.print_stage2 then
           IO.println "STAGE 2:"
           stage2state.dump
         let stage3 ← stage3 config stage2state
+        logProgress "stage 3 complete (diff + highlighting); emitting JSON"
         IO.println <| (Lean.toJson stage3).pretty (lineWidth := 200)
       -- we're done
       return ()
