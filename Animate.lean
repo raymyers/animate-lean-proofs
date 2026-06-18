@@ -26,7 +26,7 @@ structure Config where
   max_match_chars : Nat := 3000
   -- Goal states longer than this (chars) are abbreviated (head + tail, middle
   -- elided) before diffing/highlighting/rendering. 0 = unlimited.
-  max_goal_chars : Nat := 1200
+  max_goal_chars : Nat := 400
 
 def parseArgs (args : Array String) : IO Config := do
   if args.size < 2 then

@@ -37,7 +37,7 @@ open the animation in the Blender GUI for interactive scrubbing instead.
   stderr. This is the first thing to reach for when a run seems to hang; it
   localizes the stall (imports vs. elaboration vs. stage 1/2/3 vs. a specific
   goal) in seconds. stderr only, so it never pollutes the JSON on stdout.
-- `--max-goal-chars N` (default 1200, 0 = unlimited) — goal states longer than
+- `--max-goal-chars N` (default 400, 0 = unlimited) — goal states longer than
   this are abbreviated (head + `⟨… elided …⟩` + tail) before diffing/rendering.
 - `--max-match-chars N` (default 3000) — goals larger than this skip the
   char-level diff entirely (animate as a replace, not a morph).
