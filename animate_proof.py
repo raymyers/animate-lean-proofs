@@ -13,8 +13,10 @@ sys.path.append(os.getcwd())
 import common
 
 common.set_render_engine_from_env()
-bpy.context.scene.render.image_settings.file_format = 'FFMPEG'
-bpy.context.scene.render.ffmpeg.constant_rate_factor = 'PERC_LOSSLESS'
+# Output format is configured at render time (see --out handling at the bottom).
+# Blender 5.x refuses to assign the 'FFMPEG' file_format in background mode, so for
+# video we render a PNG sequence and mux it with ffmpeg rather than using Blender's
+# built-in muxer.
 FPS = common.envDefault("FPS", 60, int)
 RESOLUTION_X = 1920
 RESOLUTION_Y = 1080
@@ -758,6 +760,11 @@ parser.add_argument("--switch_focus_frame_count", type=int, default=30,
                     help="how many frames to use to switch focus")
 parser.add_argument("--foreground_ratio_y", type=float, default=0.3,
                     help="fraction of vertical space taken up by the tactic top panel")
+parser.add_argument("--out", default=None,
+                    help="render the animation to this video file (e.g. out.mp4); "
+                         "requires ffmpeg on PATH. Implied in background (-b) mode. "
+                         "When omitted in GUI mode, the scene is just set up for "
+                         "interactive playback.")
 
 script_args = []
 found_double_dash = False
@@ -781,8 +788,45 @@ world = World(action_frame_count = args.action_frame_count,
 world.init(movie_json)
 
 world.current_frame = 0
-for area in bpy.context.screen.areas:
-    if area.type == 'VIEW_3D':
-        for space in area.spaces:
-            if space.type == 'VIEW_3D':
-                space.shading.type = 'RENDERED'
+
+
+def render_to_video(out_path):
+    """Render the built animation to a video file via a PNG sequence + ffmpeg.
+
+    Blender 5.x can't set the FFMPEG file_format in background mode, and image
+    sequences are restartable, so we render frames and mux them ourselves.
+    """
+    import subprocess
+    import tempfile
+    import shutil
+
+    scene = bpy.context.scene
+    frames_dir = tempfile.mkdtemp(prefix="animate_frames_")
+    scene.render.image_settings.file_format = 'PNG'
+    scene.render.filepath = os.path.join(frames_dir, "frame_")
+    print(f"rendering frames {scene.frame_start}..{scene.frame_end} "
+          f"@ {scene.render.resolution_x}x{scene.render.resolution_y}")
+    bpy.ops.render.render(animation=True)
+
+    cmd = ["ffmpeg", "-y", "-framerate", str(scene.render.fps),
+           "-start_number", str(scene.frame_start),
+           "-i", os.path.join(frames_dir, "frame_%04d.png"),
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+           out_path]
+    subprocess.run(cmd, check=True)
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    print(f"wrote {out_path}")
+
+
+if args.out:
+    render_to_video(args.out)
+elif bpy.app.background:
+    print("scene built. Pass --out <file.mp4> to render a video, "
+          "or open this file in the Blender GUI to play it back interactively.")
+else:
+    # Interactive GUI: switch the 3D viewport to rendered shading for playback.
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    space.shading.type = 'RENDERED'

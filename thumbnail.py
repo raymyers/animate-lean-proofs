@@ -13,7 +13,9 @@ sys.path.append(os.getcwd())
 import common
 
 common.set_render_engine_from_env(default="CYCLES")
-bpy.context.scene.render.image_settings.file_format = 'FFMPEG'
+# A thumbnail is a single still, so render to a PNG image (the Blender 5.x API
+# also rejects the 'FFMPEG' format in background mode).
+bpy.context.scene.render.image_settings.file_format = 'PNG'
 FPS = common.envDefault("FPS", 60, int)
 RESOLUTION_X = 1280
 RESOLUTION_Y = 720
